@@ -17,3 +17,5 @@ logs/*.log
 # Environment
 .env
 venv/
+
+/net-commander

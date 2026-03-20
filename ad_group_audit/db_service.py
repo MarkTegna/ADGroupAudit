@@ -26,10 +26,15 @@ class DatabaseService:
         self.conn = None
 
     def connect(self) -> None:
-        """Connect to SQL Server using config parameters."""
+        """Connect to SQL Server using config parameters.
+
+        Auto-detects the best available ODBC driver (prefers 18, falls back to 17,
+        then generic 'SQL Server').
+        """
+        driver = self._detect_odbc_driver()
         try:
             conn_str = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                f"DRIVER={{{driver}}};"
                 f"SERVER={self.config.server},{self.config.port};"
                 f"DATABASE={self.config.database};"
                 f"UID={self.config.username};"
@@ -39,12 +44,32 @@ class DatabaseService:
             )
             self.conn = pyodbc.connect(conn_str)
             self.conn.timeout = self.config.command_timeout
-            logger.info("Connected to SQL Server: %s:%s/%s",
-                        self.config.server, self.config.port, self.config.database)
+            logger.info("Connected to SQL Server: %s:%s/%s (driver: %s)",
+                        self.config.server, self.config.port,
+                        self.config.database, driver)
         except pyodbc.Error as e:
-            logger.error("SQL Server connection failed - Server: %s, Port: %s, Database: %s - %s",
-                         self.config.server, self.config.port, self.config.database, e)
+            logger.error("SQL Server connection failed - Server: %s, Port: %s, "
+                         "Database: %s, Driver: %s - %s",
+                         self.config.server, self.config.port,
+                         self.config.database, driver, e)
             raise
+
+    @staticmethod
+    def _detect_odbc_driver() -> str:
+        """Find the best available ODBC Driver for SQL Server."""
+        preferred = [
+            "ODBC Driver 18 for SQL Server",
+            "ODBC Driver 17 for SQL Server",
+            "SQL Server",
+        ]
+        available = pyodbc.drivers()
+        for drv in preferred:
+            if drv in available:
+                return drv
+        raise RuntimeError(
+            "No SQL Server ODBC driver found. Install 'ODBC Driver 17 for SQL Server' "
+            "or 'ODBC Driver 18 for SQL Server' from Microsoft."
+        )
 
     def ensure_schema(self) -> None:
         """Create required tables if they don't exist."""
