@@ -1,0 +1,7 @@
+ldap3
+pyodbc
+winkerberos
+openpyxl
+pyinstaller
+pytest
+hypothesis
