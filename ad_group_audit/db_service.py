@@ -185,7 +185,20 @@ class DatabaseService:
                 INSERT (dn, name, domain, usn_changed)
                 VALUES (source.dn, source.name, source.domain, source.usn_changed);
         """, group.dn, group.name, domain, group.usn_changed)
+
+    def upsert_groups_batch(self, groups: list, domain: str) -> None:
+        """Upsert a list of ADGroup objects in a single transaction."""
+        for group in groups:
+            self.upsert_group(group, domain)
         self.conn.commit()
+        logger.info("Upserted %d groups for domain %s", len(groups), domain)
+
+    def upsert_ous_batch(self, ous: list, domain: str) -> None:
+        """Upsert a list of OU dicts in a single transaction."""
+        for ou in ous:
+            self.upsert_ou(ou["dn"], ou["name"], domain)
+        self.conn.commit()
+        logger.info("Upserted %d OUs for domain %s", len(ous), domain)
 
     def get_protected_groups(self, domain: str) -> list:
         """Get all protected groups for a domain (these are the groups we audit)."""
@@ -282,7 +295,6 @@ class DatabaseService:
                 INSERT (ou_dn, ou_name, domain)
                 VALUES (source.ou_dn, source.ou_name, source.domain);
         """, ou_dn, ou_name, domain)
-        self.conn.commit()
 
     def set_ou_monitored(self, ou_dn: str, monitored: bool) -> None:
         """Set the monitored flag for an OU."""

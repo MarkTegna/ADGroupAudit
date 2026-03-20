@@ -66,30 +66,40 @@ class AuditEngine:
         return 1 if failures == len(self.config.domains) else 0
 
     def audit_domain(self, domain_config: DomainConfig) -> None:
-        """Audit a single domain: connect AD, sync groups/OUs, audit membership."""
+        """Audit a single domain: fetch AD data, sync to DB, audit protected groups.
+
+        Fetches all groups and OUs from AD first, then disconnects to avoid
+        LDAP timeout during the lengthy DB sync. Reconnects for the audit phase.
+        """
         ad = ADService(domain_config,
                       username=domain_config.ldap_username,
                       password=domain_config.ldap_password)
         ad.connect()
+
+        # Phase 1: Fetch all data from AD into memory
+        all_groups = ad.get_all_groups()
+        logger.info("Discovered %d groups in domain %s",
+                    len(all_groups), domain_config.name)
+
+        all_ous = ad.get_all_ous()
+        logger.info("Discovered %d OUs in domain %s",
+                    len(all_ous), domain_config.name)
+
+        ad.disconnect()
+
+        # Phase 2: Sync to DB (no AD connection needed)
+        self.db.upsert_groups_batch(all_groups, domain_config.name)
+        self.db.upsert_ous_batch(all_ous, domain_config.name)
+
+        # Phase 3: Reconnect to AD and audit protected groups
+        protected_groups = self.db.get_protected_groups(domain_config.name)
+        if not protected_groups:
+            logger.info("No protected groups to audit in %s",
+                        domain_config.name)
+            return
+
+        ad.connect()
         try:
-            # Get all groups from AD and sync to DB
-            all_groups = ad.get_all_groups()
-            logger.info("Discovered %d groups in domain %s",
-                        len(all_groups), domain_config.name)
-            for group in all_groups:
-                self.db.upsert_group(group, domain_config.name)
-
-            # Sync all OUs from AD into DB
-            all_ous = ad.get_all_ous()
-            logger.info("Discovered %d OUs in domain %s",
-                        len(all_ous), domain_config.name)
-            for ou in all_ous:
-                self.db.upsert_ou(
-                    ou["dn"], ou["name"], domain_config.name
-                )
-
-            # Audit each protected group
-            protected_groups = self.db.get_protected_groups(domain_config.name)
             for group in protected_groups:
                 try:
                     self.audit_group(group, ad)
