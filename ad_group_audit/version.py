@@ -1,5 +1,5 @@
 """Version information for AD Group Audit."""
 
-__version__ = "0.0.17"
+__version__ = "0.0.19"
 __author__ = "Mark Oldham"
-__compile_date__ = "2026-03-20"
+__compile_date__ = "2026-03-30"

@@ -109,6 +109,14 @@ class DatabaseService:
             CREATE NONCLUSTERED INDEX IX_Membership_group_dn
             ON Membership (group_dn) INCLUDE (member_dn, first_not_seen)
         """)
+        # Index for fast mark_member_removed updates
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.indexes
+                          WHERE name = 'IX_Membership_group_member_active'
+                          AND object_id = OBJECT_ID('Membership'))
+            CREATE NONCLUSTERED INDEX IX_Membership_group_member_active
+            ON Membership (group_dn, member_dn, first_not_seen)
+        """)
         cursor.execute("""
             IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'MonitoredOUs')
             CREATE TABLE MonitoredOUs (
@@ -187,16 +195,46 @@ class DatabaseService:
         """, group.dn, group.name, domain, group.usn_changed)
 
     def upsert_groups_batch(self, groups: list, domain: str) -> None:
-        """Upsert a list of ADGroup objects in a single transaction."""
-        for group in groups:
-            self.upsert_group(group, domain)
+        """Upsert a list of ADGroup objects using fast executemany."""
+        if not groups:
+            return
+        cursor = self.conn.cursor()
+        cursor.fast_executemany = True
+        params = [(g.dn, g.name, domain, g.usn_changed) for g in groups]
+        cursor.executemany("""
+            MERGE Groups AS target
+            USING (SELECT ? AS dn, ? AS name, ? AS domain, ? AS usn_changed) AS source
+            ON target.dn = source.dn AND target.domain = source.domain
+            WHEN MATCHED THEN
+                UPDATE SET name = source.name,
+                           usn_changed = CASE WHEN target.is_protected = 1
+                                              THEN target.usn_changed
+                                              ELSE source.usn_changed END,
+                           updated_at = GETDATE()
+            WHEN NOT MATCHED THEN
+                INSERT (dn, name, domain, usn_changed)
+                VALUES (source.dn, source.name, source.domain, source.usn_changed);
+        """, params)
         self.conn.commit()
         logger.info("Upserted %d groups for domain %s", len(groups), domain)
 
     def upsert_ous_batch(self, ous: list, domain: str) -> None:
-        """Upsert a list of OU dicts in a single transaction."""
-        for ou in ous:
-            self.upsert_ou(ou["dn"], ou["name"], domain)
+        """Upsert a list of OU dicts using fast executemany."""
+        if not ous:
+            return
+        cursor = self.conn.cursor()
+        cursor.fast_executemany = True
+        params = [(ou["dn"], ou["name"], domain) for ou in ous]
+        cursor.executemany("""
+            MERGE MonitoredOUs AS target
+            USING (SELECT ? AS ou_dn, ? AS ou_name, ? AS domain) AS source
+            ON target.ou_dn = source.ou_dn AND target.domain = source.domain
+            WHEN MATCHED THEN
+                UPDATE SET ou_name = source.ou_name, updated_at = GETDATE()
+            WHEN NOT MATCHED THEN
+                INSERT (ou_dn, ou_name, domain)
+                VALUES (source.ou_dn, source.ou_name, source.domain);
+        """, params)
         self.conn.commit()
         logger.info("Upserted %d OUs for domain %s", len(ous), domain)
 
@@ -249,7 +287,10 @@ class DatabaseService:
         self.conn.commit()
 
     def set_group_protected(self, group_dn: str, protected: bool) -> None:
-        """Set the protected flag for a group. Clears USN when enabling so next run enumerates."""
+        """Set the protected flag for a group. Clears USN when enabling so next run enumerates.
+
+        Does not commit — caller should commit.
+        """
         cursor = self.conn.cursor()
         if protected:
             cursor.execute(
@@ -262,7 +303,6 @@ class DatabaseService:
                 "UPDATE Groups SET is_protected = 0, updated_at = GETDATE() WHERE dn = ?",
                 group_dn,
             )
-        self.conn.commit()
 
     def get_stored_usn(self, group_dn: str) -> int | None:
         """Get the stored USNChanged value for a group."""
@@ -272,13 +312,12 @@ class DatabaseService:
         return row.usn_changed if row else None
 
     def update_usn(self, group_dn: str, usn: int) -> None:
-        """Update the stored USNChanged value for a group."""
+        """Update the stored USNChanged value for a group (does not commit)."""
         cursor = self.conn.cursor()
         cursor.execute(
             "UPDATE Groups SET usn_changed = ?, updated_at = GETDATE() WHERE dn = ?",
             usn, group_dn,
         )
-        self.conn.commit()
 
     # --- OU operations ---
 
@@ -306,13 +345,12 @@ class DatabaseService:
         self.conn.commit()
 
     def set_ou_protected(self, ou_dn: str, protected: bool) -> None:
-        """Set the protected flag for an OU."""
+        """Set the protected flag for an OU. Does not commit — caller should commit."""
         cursor = self.conn.cursor()
         cursor.execute(
             "UPDATE MonitoredOUs SET is_protected = ?, updated_at = GETDATE() WHERE ou_dn = ?",
             1 if protected else 0, ou_dn,
         )
-        self.conn.commit()
 
     def add_monitored_ou(self, ou_dn: str, domain: str) -> None:
         """Add an OU to the monitored list (legacy compat)."""
@@ -404,20 +442,48 @@ class DatabaseService:
 
     def add_member(self, group_dn: str, member_dn: str, first_seen: date,
                    domain: str = "") -> None:
-        """Add a new membership record."""
+        """Add a new membership record (does not commit — caller should commit)."""
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO Membership (group_dn, member_dn, domain, first_seen)
             VALUES (?, ?, ?, ?)
         """, group_dn, member_dn, domain, first_seen)
-        self.conn.commit()
 
     def mark_member_removed(self, group_dn: str, member_dn: str,
                             not_seen: date) -> None:
-        """Mark an active member as removed by setting first_not_seen date."""
+        """Mark an active member as removed (does not commit — caller should commit)."""
         cursor = self.conn.cursor()
         cursor.execute("""
             UPDATE Membership SET first_not_seen = ?
             WHERE group_dn = ? AND member_dn = ? AND first_not_seen IS NULL
         """, not_seen, group_dn, member_dn)
+
+    def add_members_batch(self, members: list, group_dn: str,
+                          first_seen: date, domain: str = "") -> None:
+        """Batch-insert new membership records using fast executemany."""
+        if not members:
+            return
+        cursor = self.conn.cursor()
+        cursor.fast_executemany = True
+        params = [(group_dn, m, domain, first_seen) for m in members]
+        cursor.executemany("""
+            INSERT INTO Membership (group_dn, member_dn, domain, first_seen)
+            VALUES (?, ?, ?, ?)
+        """, params)
+
+    def mark_members_removed_batch(self, members: list, group_dn: str,
+                                   not_seen: date) -> None:
+        """Batch-update removed members using fast executemany."""
+        if not members:
+            return
+        cursor = self.conn.cursor()
+        cursor.fast_executemany = True
+        params = [(not_seen, group_dn, m) for m in members]
+        cursor.executemany("""
+            UPDATE Membership SET first_not_seen = ?
+            WHERE group_dn = ? AND member_dn = ? AND first_not_seen IS NULL
+        """, params)
+
+    def commit(self) -> None:
+        """Explicitly commit the current transaction."""
         self.conn.commit()

@@ -148,10 +148,11 @@ class AuditManagerGUI:
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT)
 
-        self._sync_and_load()
+        # Load from DB immediately for fast startup (no AD connection needed)
+        self._load_data()
 
     def _sync_and_load(self):
-        """Sync OUs from AD into DB, then reload tree."""
+        """Sync OUs and groups from AD into DB, then reload tree."""
         domain_name = self.domain_var.get()
         if not domain_name:
             return
@@ -164,7 +165,7 @@ class AuditManagerGUI:
         if not domain_config:
             return
 
-        self.status_var.set("Syncing OUs from AD...")
+        self.status_var.set("Syncing from AD...")
         self.root.update_idletasks()
 
         try:
@@ -175,12 +176,15 @@ class AuditManagerGUI:
             )
             ad.connect()
             all_ad_ous = ad.get_all_ous()
+            all_ad_groups = ad.get_all_groups()
             ad.disconnect()
 
-            for ou in all_ad_ous:
-                self.db.upsert_ou(ou["dn"], ou["name"], domain_name)
+            self.db.upsert_ous_batch(all_ad_ous, domain_name)
+            self.db.upsert_groups_batch(all_ad_groups, domain_name)
 
-            self.status_var.set(f"Synced {len(all_ad_ous)} OUs from AD")
+            self.status_var.set(
+                f"Synced {len(all_ad_ous)} OUs and {len(all_ad_groups)} groups from AD"
+            )
         except Exception as e:
             self.status_var.set(f"AD sync failed: {e}")
             logger.error("AD sync failed: %s", e)
@@ -333,7 +337,7 @@ class AuditManagerGUI:
             self.status_var.set("Ready")
 
     def _save_changes(self):
-        """Persist all pending changes to DB."""
+        """Persist all pending changes to DB in a single transaction."""
         if not self.ou_changes and not self.group_changes:
             messagebox.showinfo("Save", "No changes to save.")
             return
@@ -345,6 +349,8 @@ class AuditManagerGUI:
         for group_dn, protected in self.group_changes.items():
             self.db.set_group_protected(group_dn, protected)
             saved += 1
+
+        self.db.commit()
 
         self.ou_changes.clear()
         self.group_changes.clear()

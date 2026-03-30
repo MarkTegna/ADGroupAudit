@@ -134,18 +134,21 @@ class AuditEngine:
 
         today = date.today()
 
-        # Record added members
-        for member_dn in diff.added:
-            self.db.add_member(group.dn, member_dn, today, group.domain)
-            logger.info("  Added: %s -> %s", member_dn, group.name)
+        # Batch-insert added members
+        if diff.added:
+            self.db.add_members_batch(diff.added, group.dn, today, group.domain)
+            for member_dn in diff.added:
+                logger.info("  Added: %s -> %s", member_dn, group.name)
 
-        # Record removed members
-        for member_dn in diff.removed:
-            self.db.mark_member_removed(group.dn, member_dn, today)
-            logger.info("  Removed: %s from %s", member_dn, group.name)
+        # Batch-update removed members
+        if diff.removed:
+            self.db.mark_members_removed_batch(diff.removed, group.dn, today)
+            for member_dn in diff.removed:
+                logger.info("  Removed: %s from %s", member_dn, group.name)
 
-        # Update stored USN
+        # Update stored USN and commit all changes in one go
         self.db.update_usn(group.dn, current_usn)
+        self.db.commit()
 
         # Send email alert if protected and changes detected
         if group.is_protected and (diff.added or diff.removed):
