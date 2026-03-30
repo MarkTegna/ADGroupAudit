@@ -14,7 +14,6 @@ Author: Mark Oldham
 import argparse
 import os
 import subprocess
-import sys
 from datetime import datetime
 
 from ldap3 import ALL, KERBEROS, NTLM, SASL, SUBTREE, Connection, Server
@@ -92,7 +91,7 @@ def discover_domain_controllers(domain: str) -> list:
         except Exception as e:
             print(f"  [FAIL] nltest fallback failed: {e}")
 
-    return sorted(set(dcs))
+    return sorted(set(dc.lower() for dc in dcs))
 
 
 def query_dc_members(dc_hostname: str, group_dn: str,
@@ -144,32 +143,34 @@ def query_dc_members(dc_hostname: str, group_dn: str,
                 pass
 
 
-def print_report(group_dn: str, dc_results: dict, domain: str):
-    """Print the comparison report to stdout."""
+def build_report(group_dn: str, dc_results: dict, domain: str) -> list:
+    """Build the comparison report as a list of lines."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\nDC Replication Check - {timestamp}")
-    print(f"Domain: {domain}")
-    print(f"Group:  {group_dn}")
-    print("=" * 70)
+    lines = [
+        f"DC Replication Check - {timestamp}",
+        f"Domain: {domain}",
+        f"Group:  {group_dn}",
+        "=" * 70,
+    ]
 
     # Separate successful and failed DCs
     successful = {dc: r for dc, r in dc_results.items() if r["error"] is None}
     failed = {dc: r for dc, r in dc_results.items() if r["error"] is not None}
 
     if failed:
-        print(f"\n  Unreachable DCs ({len(failed)}):")
+        lines.append(f"\n  Unreachable DCs ({len(failed)}):")
         for dc, r in sorted(failed.items()):
-            print(f"    [FAIL] {dc}: {r['error']}")
+            lines.append(f"    [FAIL] {dc}: {r['error']}")
 
     if not successful:
-        print("\n  No DCs responded successfully. Cannot compare.")
-        return
+        lines.append("\n  No DCs responded successfully. Cannot compare.")
+        return lines
 
     # Show member counts per DC
-    print(f"\n  Member counts ({len(successful)} DCs responded):")
+    lines.append(f"\n  Member counts ({len(successful)} DCs responded):")
     for dc in sorted(successful.keys()):
         count = len(successful[dc]["members"])
-        print(f"    {dc}: {count} members")
+        lines.append(f"    {dc}: {count} members")
 
     # Find the consensus (most common member set)
     all_members = set()
@@ -194,19 +195,40 @@ def print_report(group_dn: str, dc_results: dict, domain: str):
             })
 
     if not discrepancies:
-        print(f"\n  [OK] All {len(successful)} DCs agree on membership "
-              f"({len(all_members)} members).")
+        lines.append(
+            f"\n  [OK] All {len(successful)} DCs agree on membership "
+            f"({len(all_members)} members)."
+        )
     else:
-        print(f"\n  [WARN] {len(discrepancies)} discrepancies found:")
-        print("-" * 70)
+        lines.append(f"\n  [WARN] {len(discrepancies)} discrepancies found:")
+        lines.append("-" * 70)
         for d in discrepancies:
-            print(f"\n  Member: {d['member']}")
-            print(f"    Present on  ({len(d['present_on'])}): "
-                  f"{', '.join(d['present_on'])}")
-            print(f"    Missing from ({len(d['missing_from'])}): "
-                  f"{', '.join(d['missing_from'])}")
+            lines.append(f"\n  Member: {d['member']}")
+            lines.append(
+                f"    Present on  ({len(d['present_on'])}): "
+                f"{', '.join(d['present_on'])}"
+            )
+            lines.append(
+                f"    Missing from ({len(d['missing_from'])}): "
+                f"{', '.join(d['missing_from'])}"
+            )
 
-    print("\n" + "=" * 70)
+    lines.append("\n" + "=" * 70)
+    return lines
+
+
+def write_report(lines: list, output_dir: str = "logs") -> str:
+    """Write report lines to a timestamped text file.
+
+    Returns the output file path.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H-%M")
+    filename = f"dc-repl-check-{timestamp}.txt"
+    filepath = os.path.join(output_dir, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return filepath
 
 
 def main(args=None) -> int:
@@ -266,7 +288,11 @@ def main(args=None) -> int:
             print(f"[OK] {len(result['members'])} members")
         dc_results[dc] = result
 
-    print_report(group_dn, dc_results, domain)
+    report_lines = build_report(group_dn, dc_results, domain)
+    print("\n".join(report_lines))
+
+    filepath = write_report(report_lines)
+    print(f"\nReport saved to: {filepath}")
     return 0
 
 
