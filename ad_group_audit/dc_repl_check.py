@@ -12,6 +12,7 @@ Author: Mark Oldham
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -100,6 +101,7 @@ def query_dc_members(dc_hostname: str, group_dn: str,
 
     Returns dict with 'members' (set of DNs), 'error' (str or None).
     """
+    conn = None
     try:
         server = Server(dc_hostname, get_info=ALL, connect_timeout=10)
         if username:
@@ -128,13 +130,18 @@ def query_dc_members(dc_hostname: str, group_dn: str,
             if hasattr(entry, "member") and entry.member:
                 members = {str(m) for m in entry.member}
 
-        conn.unbind()
         return {"members": members, "error": None}
 
     except LDAPException as e:
         return {"members": set(), "error": str(e)}
     except Exception as e:
         return {"members": set(), "error": str(e)}
+    finally:
+        if conn:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
 
 
 def print_report(group_dn: str, dc_results: dict, domain: str):
@@ -264,4 +271,6 @@ def main(args=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # Force exit to prevent ldap3/Kerberos background threads from hanging
+    os._exit(rc)
