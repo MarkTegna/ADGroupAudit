@@ -67,6 +67,7 @@ class AuditedGroup:
 @dataclass
 class MemberRecord:
     member_dn: str
+    member_guid: str
     group_dn: str
     first_seen: date
     first_not_seen: Optional[date] = None

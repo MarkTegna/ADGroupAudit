@@ -95,11 +95,20 @@ class DatabaseService:
                 id INT IDENTITY(1,1) PRIMARY KEY,
                 group_dn NVARCHAR(1000) NOT NULL,
                 member_dn NVARCHAR(1000) NOT NULL,
+                member_guid NVARCHAR(36) NOT NULL DEFAULT '',
                 domain NVARCHAR(255) NOT NULL,
                 first_seen DATE NOT NULL,
                 first_not_seen DATE NULL,
                 created_at DATETIME2 NOT NULL DEFAULT GETDATE()
             )
+        """)
+        # Migrate: add member_guid column if table exists but lacks it
+        cursor.execute("""
+            IF EXISTS (SELECT * FROM sys.tables WHERE name = 'Membership')
+               AND NOT EXISTS (SELECT * FROM sys.columns
+                               WHERE object_id = OBJECT_ID('Membership')
+                               AND name = 'member_guid')
+            ALTER TABLE Membership ADD member_guid NVARCHAR(36) NOT NULL DEFAULT ''
         """)
         # Index for fast membership lookups by group
         cursor.execute("""
@@ -107,15 +116,22 @@ class DatabaseService:
                           WHERE name = 'IX_Membership_group_dn'
                           AND object_id = OBJECT_ID('Membership'))
             CREATE NONCLUSTERED INDEX IX_Membership_group_dn
-            ON Membership (group_dn) INCLUDE (member_dn, first_not_seen)
+            ON Membership (group_dn) INCLUDE (member_dn, member_guid, first_not_seen)
         """)
-        # Index for fast mark_member_removed updates
+        # Index for fast mark_member_removed updates (by GUID)
         cursor.execute("""
             IF NOT EXISTS (SELECT * FROM sys.indexes
-                          WHERE name = 'IX_Membership_group_member_active'
+                          WHERE name = 'IX_Membership_group_guid_active'
                           AND object_id = OBJECT_ID('Membership'))
-            CREATE NONCLUSTERED INDEX IX_Membership_group_member_active
-            ON Membership (group_dn, member_dn, first_not_seen)
+            CREATE NONCLUSTERED INDEX IX_Membership_group_guid_active
+            ON Membership (group_dn, member_guid, first_not_seen)
+        """)
+        # Drop old index if it exists (replaced by GUID-based index)
+        cursor.execute("""
+            IF EXISTS (SELECT * FROM sys.indexes
+                       WHERE name = 'IX_Membership_group_member_active'
+                       AND object_id = OBJECT_ID('Membership'))
+            DROP INDEX IX_Membership_group_member_active ON Membership
         """)
         cursor.execute("""
             IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'MonitoredOUs')
@@ -428,60 +444,83 @@ class DatabaseService:
         """Get all active members (first_not_seen IS NULL) for a group."""
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT member_dn, group_dn, first_seen, first_not_seen
+            SELECT member_dn, member_guid, group_dn, first_seen, first_not_seen
             FROM Membership
             WHERE group_dn = ? AND first_not_seen IS NULL
         """, group_dn)
         return [
             MemberRecord(
-                member_dn=row.member_dn, group_dn=row.group_dn,
+                member_dn=row.member_dn, member_guid=row.member_guid,
+                group_dn=row.group_dn,
                 first_seen=row.first_seen, first_not_seen=row.first_not_seen,
             )
             for row in cursor.fetchall()
         ]
 
-    def add_member(self, group_dn: str, member_dn: str, first_seen: date,
-                   domain: str = "") -> None:
-        """Add a new membership record (does not commit — caller should commit)."""
+    def add_member(self, group_dn: str, member_dn: str, member_guid: str,
+                   first_seen: date, domain: str = "") -> None:
+        """Add a new membership record (does not commit -- caller should commit)."""
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO Membership (group_dn, member_dn, domain, first_seen)
-            VALUES (?, ?, ?, ?)
-        """, group_dn, member_dn, domain, first_seen)
+            INSERT INTO Membership (group_dn, member_dn, member_guid, domain, first_seen)
+            VALUES (?, ?, ?, ?, ?)
+        """, group_dn, member_dn, member_guid, domain, first_seen)
 
-    def mark_member_removed(self, group_dn: str, member_dn: str,
+    def mark_member_removed(self, group_dn: str, member_guid: str,
                             not_seen: date) -> None:
-        """Mark an active member as removed (does not commit — caller should commit)."""
+        """Mark an active member as removed by GUID (does not commit)."""
         cursor = self.conn.cursor()
         cursor.execute("""
             UPDATE Membership SET first_not_seen = ?
-            WHERE group_dn = ? AND member_dn = ? AND first_not_seen IS NULL
-        """, not_seen, group_dn, member_dn)
+            WHERE group_dn = ? AND member_guid = ? AND first_not_seen IS NULL
+        """, not_seen, group_dn, member_guid)
 
     def add_members_batch(self, members: list, group_dn: str,
                           first_seen: date, domain: str = "") -> None:
-        """Batch-insert new membership records using fast executemany."""
+        """Batch-insert new membership records using fast executemany.
+
+        members: list of dicts with 'guid' and 'dn' keys.
+        """
         if not members:
             return
         cursor = self.conn.cursor()
         cursor.fast_executemany = True
-        params = [(group_dn, m, domain, first_seen) for m in members]
+        params = [(group_dn, m["dn"], m["guid"], domain, first_seen)
+                  for m in members]
         cursor.executemany("""
-            INSERT INTO Membership (group_dn, member_dn, domain, first_seen)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO Membership (group_dn, member_dn, member_guid, domain, first_seen)
+            VALUES (?, ?, ?, ?, ?)
         """, params)
 
     def mark_members_removed_batch(self, members: list, group_dn: str,
                                    not_seen: date) -> None:
-        """Batch-update removed members using fast executemany."""
+        """Batch-update removed members by GUID using fast executemany.
+
+        members: list of dicts with 'guid' key.
+        """
         if not members:
             return
         cursor = self.conn.cursor()
         cursor.fast_executemany = True
-        params = [(not_seen, group_dn, m) for m in members]
+        params = [(not_seen, group_dn, m["guid"]) for m in members]
         cursor.executemany("""
             UPDATE Membership SET first_not_seen = ?
-            WHERE group_dn = ? AND member_dn = ? AND first_not_seen IS NULL
+            WHERE group_dn = ? AND member_guid = ? AND first_not_seen IS NULL
+        """, params)
+
+    def update_member_dns(self, updates: list, group_dn: str) -> None:
+        """Batch-update member_dn for members whose DN has changed (e.g. OU move).
+
+        updates: list of dicts with 'guid' and 'dn' keys.
+        """
+        if not updates:
+            return
+        cursor = self.conn.cursor()
+        cursor.fast_executemany = True
+        params = [(u["dn"], group_dn, u["guid"]) for u in updates]
+        cursor.executemany("""
+            UPDATE Membership SET member_dn = ?
+            WHERE group_dn = ? AND member_guid = ? AND first_not_seen IS NULL
         """, params)
 
     def commit(self) -> None:

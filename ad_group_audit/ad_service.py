@@ -19,6 +19,20 @@ logger = logging.getLogger("ad_group_audit")
 PAGE_SIZE = 1000
 
 
+def _ldap_escape(value: str) -> str:
+    """Escape special characters for use in LDAP filter values."""
+    replacements = [
+        ("\\", "\\5c"),
+        ("*", "\\2a"),
+        ("(", "\\28"),
+        (")", "\\29"),
+        ("\x00", "\\00"),
+    ]
+    for char, escaped in replacements:
+        value = value.replace(char, escaped)
+    return value
+
+
 def _resolve_dc(domain: str) -> str:
     """Resolve the domain controller hostname for a domain using nltest.
 
@@ -161,7 +175,12 @@ class ADService:
         return groups
 
     def get_group_members(self, group_dn: str) -> list:
-        """Return list of member DNs for a group."""
+        """Return list of dicts with member objectGUID and DN for a group.
+
+        Each dict has keys 'guid' (str) and 'dn' (str).
+        Uses the group's member attribute to get DNs, then resolves each
+        member's objectGUID via a single paged search.
+        """
         self.conn.search(
             search_base=group_dn,
             search_filter="(objectClass=group)",
@@ -171,9 +190,45 @@ class ADService:
         if not self.conn.entries:
             return []
         entry = self.conn.entries[0]
-        if hasattr(entry, "member") and entry.member:
-            return [str(m) for m in entry.member]
-        return []
+        if not hasattr(entry, "member") or not entry.member:
+            return []
+
+        member_dns = [str(m) for m in entry.member]
+        if not member_dns:
+            return []
+
+        # Resolve objectGUID for all members in a single search
+        # Build an OR filter for all member DNs using distinguishedName
+        results = []
+        # Process in chunks to avoid overly long LDAP filters
+        chunk_size = 50
+        for i in range(0, len(member_dns), chunk_size):
+            chunk = member_dns[i:i + chunk_size]
+            if len(chunk) == 1:
+                search_filter = (
+                    f"(distinguishedName={_ldap_escape(chunk[0])})"
+                )
+            else:
+                parts = "".join(
+                    f"(distinguishedName={_ldap_escape(dn)})"
+                    for dn in chunk
+                )
+                search_filter = f"(|{parts})"
+
+            entries = self._paged_search(
+                search_base=self.config.base_dn,
+                search_filter=search_filter,
+                attributes=["objectGUID", "distinguishedName"],
+            )
+            for e in entries:
+                try:
+                    guid = str(e.objectGUID)
+                    dn = str(e.distinguishedName)
+                    results.append({"guid": guid, "dn": dn})
+                except (ValueError, AttributeError) as err:
+                    logger.warning("Skipping member entry: %s", err)
+
+        return results
 
     def get_group_usn(self, group_dn: str) -> int:
         """Return the USNChanged attribute value for a group."""

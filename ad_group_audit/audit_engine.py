@@ -20,26 +20,41 @@ from ad_group_audit.models import (
 logger = logging.getLogger("ad_group_audit")
 
 
-def diff_membership(current: set, stored: list) -> MembershipDiff:
-    """Pure function: compute membership diff between AD and DB.
+def diff_membership(current: list, stored: list) -> dict:
+    """Compute membership diff between AD and DB using objectGUID.
 
     Args:
-        current: Set of member DNs currently in AD.
+        current: List of dicts with 'guid' and 'dn' keys from AD.
         stored: List of MemberRecord objects from DB (active members only).
 
     Returns:
-        MembershipDiff with added and removed lists.
+        Dict with 'added' (list of dicts), 'removed' (list of dicts),
+        and 'dn_updates' (list of dicts where DN changed but GUID matches).
     """
-    stored_active = {r.member_dn for r in stored}
-    added = list(current - stored_active)
-    removed = list(stored_active - current)
-    return MembershipDiff(
-        group_dn="",
-        group_name="",
-        domain="",
-        added=added,
-        removed=removed,
-    )
+    current_by_guid = {m["guid"]: m["dn"] for m in current}
+    stored_by_guid = {r.member_guid: r.member_dn for r in stored}
+
+    current_guids = set(current_by_guid.keys())
+    stored_guids = set(stored_by_guid.keys())
+
+    added_guids = current_guids - stored_guids
+    removed_guids = stored_guids - current_guids
+    common_guids = current_guids & stored_guids
+
+    added = [{"guid": g, "dn": current_by_guid[g]} for g in added_guids]
+    removed = [{"guid": g, "dn": stored_by_guid[g]} for g in removed_guids]
+
+    # Detect DN changes (user moved OU but still in group)
+    dn_updates = []
+    for g in common_guids:
+        if current_by_guid[g] != stored_by_guid[g]:
+            dn_updates.append({"guid": g, "dn": current_by_guid[g]})
+
+    return {
+        "added": added,
+        "removed": removed,
+        "dn_updates": dn_updates,
+    }
 
 
 class AuditEngine:
@@ -120,43 +135,63 @@ class AuditEngine:
         logger.info("Group %s changed (USN %s -> %d), enumerating members",
                      group.name, group.stored_usn, current_usn)
 
-        # Get current members from AD
-        current_members = set(ad.get_group_members(group.dn))
+        # Get current members from AD (list of {guid, dn} dicts)
+        current_members = ad.get_group_members(group.dn)
 
         # Get stored active members from DB
         stored_members = self.db.get_active_members(group.dn)
 
-        # Compute diff
-        diff = diff_membership(current_members, stored_members)
-        diff.group_dn = group.dn
-        diff.group_name = group.name
-        diff.domain = group.domain
+        # Compute diff by objectGUID
+        diff_result = diff_membership(current_members, stored_members)
 
         today = date.today()
 
+        # Update DNs for members who moved OUs (no add/remove noise)
+        if diff_result["dn_updates"]:
+            self.db.update_member_dns(diff_result["dn_updates"], group.dn)
+            for upd in diff_result["dn_updates"]:
+                logger.info("  DN updated: %s (GUID %s) in %s",
+                            upd["dn"], upd["guid"], group.name)
+
         # Batch-insert added members
-        if diff.added:
-            self.db.add_members_batch(diff.added, group.dn, today, group.domain)
-            for member_dn in diff.added:
-                logger.info("  Added: %s -> %s", member_dn, group.name)
+        if diff_result["added"]:
+            self.db.add_members_batch(
+                diff_result["added"], group.dn, today, group.domain
+            )
+            for m in diff_result["added"]:
+                logger.info("  Added: %s -> %s", m["dn"], group.name)
 
         # Batch-update removed members
-        if diff.removed:
-            self.db.mark_members_removed_batch(diff.removed, group.dn, today)
-            for member_dn in diff.removed:
-                logger.info("  Removed: %s from %s", member_dn, group.name)
+        if diff_result["removed"]:
+            self.db.mark_members_removed_batch(
+                diff_result["removed"], group.dn, today
+            )
+            for m in diff_result["removed"]:
+                logger.info("  Removed: %s from %s", m["dn"], group.name)
 
         # Update stored USN and commit all changes in one go
         self.db.update_usn(group.dn, current_usn)
         self.db.commit()
 
+        # Build display lists (DNs) for alerts and return value
+        added_dns = [m["dn"] for m in diff_result["added"]]
+        removed_dns = [m["dn"] for m in diff_result["removed"]]
+
+        diff = MembershipDiff(
+            group_dn=group.dn,
+            group_name=group.name,
+            domain=group.domain,
+            added=added_dns,
+            removed=removed_dns,
+        )
+
         # Send email alert if protected and changes detected
-        if group.is_protected and (diff.added or diff.removed):
+        if group.is_protected and (added_dns or removed_dns):
             alert = MembershipChangeAlert(
                 group_name=group.name,
                 domain=group.domain,
-                added=diff.added,
-                removed=diff.removed,
+                added=added_dns,
+                removed=removed_dns,
             )
             sent = self.email.send_alert(alert)
             if sent:
