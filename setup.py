@@ -25,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "ad-group-audit=ad_group_audit.main:main",
+            "dc-repl-check=ad_group_audit.dc_repl_check:main",
         ],
     },
 )

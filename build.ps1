@@ -20,8 +20,8 @@ if (Test-Path "dist") {
     Remove-Item -Recurse -Force "dist" -ErrorAction SilentlyContinue
 }
 
-# Run PyInstaller
-Write-Host "Running PyInstaller..."
+# Run PyInstaller - main audit tool
+Write-Host "Running PyInstaller (ad-group-audit)..."
 python -m PyInstaller --onefile `
     --name "ad-group-audit" `
     --add-data "ad_group_audit.ini;." `
@@ -30,7 +30,20 @@ python -m PyInstaller --onefile `
     ad_group_audit\main.py
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "PyInstaller build failed!"
+    Write-Host "PyInstaller build failed (ad-group-audit)!"
+    exit 1
+}
+
+# Run PyInstaller - DC replication checker
+Write-Host "Running PyInstaller (dc-repl-check)..."
+python -m PyInstaller --onefile `
+    --name "dc-repl-check" `
+    --add-data "ad_group_audit.ini;." `
+    --hidden-import "ldap3" `
+    ad_group_audit\dc_repl_check.py
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "PyInstaller build failed (dc-repl-check)!"
     exit 1
 }
 
@@ -40,6 +53,7 @@ New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 # Copy files to distribution
 Copy-Item "dist\ad-group-audit.exe" "$distDir\"
+Copy-Item "dist\dc-repl-check.exe" "$distDir\"
 
 # Create default INI if it doesn't exist
 if (-not (Test-Path "ad_group_audit.ini")) {
